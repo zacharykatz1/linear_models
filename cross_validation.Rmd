@@ -1,0 +1,268 @@
+---
+title: "cross_validation"
+author: 'Zachary Katz (UNI: zak2132)'
+date: "11/18/2021"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(viridis)
+library(modelr)
+library(mgcv)
+
+set.seed(1)
+
+knitr::opts_chunk$set(
+  fig.width = 6,
+  fig.asp = .6,
+  out.width = "90%"
+)
+
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
+
+options(
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis"
+)
+
+scale_colour_discrete = scale_colour_viridis_d
+scale_fill_discrete = scale_fill_viridis_d
+
+```
+
+**Note: tidy model packages could end up being helpful, beyond simply `modelr`**
+
+```{r}
+set.seed(1)
+
+# Create nonlinear data
+nonlin_df = 
+  tibble(
+    id = 1:100,
+    x = runif(100, 0, 1),
+    y = 1 - 10 * (x - .3) ^ 2 + rnorm(100, 0, .3)
+  )
+
+nonlin_df %>% 
+  ggplot(aes(x = x, y = y)) + 
+  geom_point()
+```
+
+```{r}
+# First, let's try cross-validation by hand, which we'll see is clunky
+# Split this data into training and test sets, and replot showing the split
+# 80/20 fit is most common
+train_df = sample_n(nonlin_df, 80)
+# Requires a perfect partitioning of training and testing data
+test_df = anti_join(nonlin_df, train_df, by = "id")
+
+ggplot(train_df, aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_point(data = test_df, color = "red")
+```
+
+Then, let's fit some models to the training data:
+
+```{r}
+# Try three models: linear, smooth, wiggly
+linear_mod = lm(y ~ x, data = train_df)
+
+# s(x) is a smooth function of x 
+smooth_mod = mgcv::gam(y ~ s(x), data = train_df)
+
+# Finally, create a model that is way too complex
+# A couple of these arguments, like k = 30, and sp, will make this model bad
+wiggly_mod = mgcv::gam(y ~ s(x, k = 30), sp = 10e-6, data = train_df)
+```
+
+Let's plot the two gam fits:
+
+```{r}
+# smooth model
+train_df %>% 
+  # Add predictions
+  add_predictions(smooth_mod) %>% 
+  ggplot(aes(x = x, y = y)) + geom_point() + 
+  # Plot the predictions
+  geom_line(aes(y = pred), color = "red")
+
+# wiggly model
+train_df %>% 
+  add_predictions(wiggly_mod) %>% 
+  ggplot(aes(x = x, y = y)) + geom_point() + 
+  geom_line(aes(y = pred), color = "red")
+
+# Could show these all together
+train_df %>% 
+  gather_predictions(linear_mod, smooth_mod, wiggly_mod) %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_line(aes(y = pred), color = "red") + 
+  facet_wrap(~model)
+```
+
+Let's compute fit with RMSE:
+
+```{r}
+# Of the three, RMSE is minimized for smooth model (want RMSE to be as low as possible)
+rmse(linear_mod, test_df)
+rmse(smooth_mod, test_df)
+rmse(wiggly_mod, test_df)
+```
+
+## CV iteratively
+
+```{r}
+# Given a data set, gives n (100) CV splits to do
+# By default, puts 20% in testing data set
+cv_df = 
+  crossv_mc(nonlin_df, 100) 
+```
+
+It saves the data once and stores the indexes for each training / testing split using a resample object.
+
+```{r}
+# Whole cv_df , but not yet in tibble form
+cv_df
+
+# Pull out first just to see which rows are included in first training set
+cv_df %>% pull(train) %>% .[[1]] %>% as_tibble
+
+# Do same for test
+cv_df %>% pull(test) %>% .[[1]] %>% as_tibble
+```
+
+```{r}
+# Map across nested data frames to create train and test tibbles
+# Put in tibble form so we can iterate over it
+cv_df =
+  cv_df %>% 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble))
+```
+
+I now have many training and testing datasets, and I’d like to fit my candidate models above and assess prediction accuracy as I did for the single training / testing split. To do this, I’ll fit models and obtain RMSEs using mutate + map & map2.
+
+```{r}
+cv_df = 
+  cv_df %>% 
+  # Apply models across training data sets
+  mutate(
+    linear_mod  = map(train, ~lm(y ~ x, data = .x)),
+    smooth_mod  = map(train, ~mgcv::gam(y ~ s(x), data = .x)),
+    wiggly_mod  = map(train, ~gam(y ~ s(x, k = 30), sp = 10e-6, data = .x))) %>% 
+  # Map RMSE across linear model column and the testing data set (hence use map2)
+  mutate(
+    rmse_linear = map2_dbl(linear_mod, test, ~rmse(model = .x, data = .y)),
+    rmse_smooth = map2_dbl(smooth_mod, test, ~rmse(model = .x, data = .y)),
+    rmse_wiggly = map2_dbl(wiggly_mod, test, ~rmse(model = .x, data = .y)))
+
+cv_df
+```
+
+We can look at the distribution of RMSE for each candidate model:
+
+```{r}
+# Smooth fit seems to be the clear winner
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  # Have to pivot to get a good boxplot or violinplot
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") %>%
+  # Sort by the order in which the factors first appear
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = model, y = rmse)) + geom_boxplot()
+```
+
+## Example: Child Growth
+
+```{r}
+child_growth = read_csv("./Data/nepalese_children.csv")
+
+child_growth %>% 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = .5)
+```
+
+Plot suggests some non-linearity, especially at low end of weight. Let's try a few models, including a piecewise linaer fit, which requires we add a "change point term."
+
+(The idea behind piecewise linear regression is that if the data follows different linear trends over different regions of the data, then we should model the regression function in pieces, which may or may not be connected.)
+
+```{r}
+# Create weight_cp for piecewise LM
+child_growth = 
+  child_growth %>% 
+  mutate(
+    weight_cp = (weight > 7) * (weight - 7))
+```
+
+The following code chunk fits each candidate model to the full data set. The piecewise linear model is nested in the linear model and could be assessed using statistical significance, but the smooth model is not nested in anything else. (Also, comparing a piecewise model with a changepoint at 7 to a piecewise model with a changepoint at 8 would be a non-nested comparison…)
+
+Then, we plot to get intuition for goodness of fit
+
+```{r}
+linear_mod = lm(armc ~ weight, data = child_growth)
+# Piecewise linear model uses new weight CP term
+pwl_mod    = lm(armc ~ weight + weight_cp, data = child_growth)
+smooth_mod = gam(armc ~ s(weight), data = child_growth)
+
+child_growth %>% 
+  # Use gather predictions for multiple models (rather than add_predictions)
+  gather_predictions(linear_mod, pwl_mod, smooth_mod) %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = .5) +
+  geom_line(aes(y = pred), color = "red") + 
+  facet_grid(~model)
+```
+
+We can't tell which is best, but we can check prediction errors using a similar process as before.
+
+```{r}
+cv_df  = 
+  crossv_mc(child_growth, 100) %>% 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble)
+  )
+
+# Then, use mutate and map or map2 to fit models and obtain corresponding RMSEs
+cv_df = 
+  cv_df %>% 
+  mutate(
+    linear_mod  = map(train, ~lm(armc ~ weight, data = .x)),
+    pwl_mod     = map(train, ~lm(armc ~ weight + weight_cp, data = .x)),
+    smooth_mod  = map(train, ~gam(armc ~ s(weight), data = as_tibble(.x)))) %>% 
+  mutate(
+    rmse_linear = map2_dbl(linear_mod, test, ~rmse(model = .x, data = .y)),
+    rmse_pwl    = map2_dbl(pwl_mod, test, ~rmse(model = .x, data = .y)),
+    rmse_smooth = map2_dbl(smooth_mod, test, ~rmse(model = .x, data = .y)))
+```
+
+Finally, we plot prediction error distribution for each model candidate:
+
+```{r}
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+Looks like there's some improvement in predictive accuracy by allowing non-linearity, though it's not clear whether this justifies a more complex model.
+
+Among the non-linear models, GAM might be better than PWL, but meh
+
+In the end, I’d probably go with the piecewise linear model – the non-linearity is clear enough that it should be accounted for, and the differences between the piecewise and gam fits are small enough that the easy interpretation of the piecewise model “wins”.
+
+
